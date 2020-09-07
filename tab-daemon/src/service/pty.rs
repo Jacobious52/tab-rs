@@ -1,4 +1,5 @@
 pub mod scrollback;
+pub mod history_buffer;
 
 // mod session;
 
