@@ -72,7 +72,8 @@ async fn main_async(matches: ArgMatches<'_>) -> anyhow::Result<()> {
         let tabs: Vec<String> = tabs.map(normalize_name).collect();
         tx.send(MainRecv::CloseTabs(tabs)).await?;
     } else {
-        tx.send(MainRecv::SelectTab("any/".to_string())).await?;
+        // List with skim
+        tx.send(MainRecv::FuzzyTabs).await?;
     }
 
     wait_for_shutdown(rx_shutdown).await;

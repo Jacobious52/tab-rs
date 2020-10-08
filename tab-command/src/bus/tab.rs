@@ -22,6 +22,12 @@ use tokio::{
     time,
 };
 
+use skim::{
+    prelude::{SkimItemReader, SkimOptionsBuilder},
+    Skim,
+};
+use std::io::Cursor;
+
 lifeline_bus!(pub struct TabBus);
 
 impl Message<TabBus> for Request {
@@ -196,6 +202,65 @@ impl CarryFrom<MainBus> for TabBus {
             Self::try_task("main_recv", async move {
                 while let Some(msg) = rx_main.recv().await {
                     match msg {
+                        MainRecv::FuzzyTabs => {
+                            let running_tabs = Self::await_initialized(&mut rx_tabs_state).await;
+                            let workspace_tabs = Self::await_workspace(&mut rx_workspace).await;
+                            let tabs = Self::merge_tabs(running_tabs, workspace_tabs);
+
+                            let selected_tab = Self::fuzzy_tabs(&tabs);
+
+                            if let Some(name) = selected_tab {
+                                let name = normalize_name(name.as_str());
+                                if let Ok(id) = std::env::var("TAB_ID") {
+                                    if let Ok(id) = id.parse() {
+                                        if let Ok(env_name) = std::env::var("TAB") {
+                                            // we don't need any change.  we can ignore it.
+                                            if name.trim() == env_name.trim() {
+                                                tx_shutdown.send(MainShutdown {}).await?;
+                                                continue;
+                                            }
+                                        }
+
+                                        info!("retasking tab {} with new selection {}.", id, &name);
+                                        let id = TabId(id);
+
+                                        Self::await_initialized(&mut rx_tabs_state).await;
+
+                                        tx_create
+                                            .send(CreateTabRequest::Named(name.clone()))
+                                            .await?;
+
+                                        debug!("retask - waiting for creation on tab {}", id);
+                                        let metadata =
+                                            Self::await_created(name, &mut rx_tabs_state).await;
+
+                                        debug!("retask - sending retask to tab {}", id);
+                                        let request = Request::Retask(id, metadata.id);
+                                        tx_websocket.send(request).await?;
+
+                                        // if we quit too early, the carrier is cancelled and our message doesn't get through.
+                                        // this sleep is not visible to the user, as the outer terminal session will emit new stdout
+                                        time::delay_for(Duration::from_millis(250)).await;
+
+                                        tx_shutdown.send(MainShutdown {}).await?;
+                                        continue;
+                                    }
+                                }
+
+                                tx_create
+                                    .send(CreateTabRequest::Named(name.clone()))
+                                    .await?;
+
+                                tx_select
+                                    .send(SelectTab::NamedTab(name))
+                                    .await
+                                    .context("send TabStateSelect")?;
+                                continue;
+                            }
+
+                            tx_shutdown.send(MainShutdown {}).await?;
+                        }
+
                         MainRecv::SelectTab(name) => {
                             let name = normalize_name(name.as_str());
                             if let Ok(id) = std::env::var("TAB_ID") {
@@ -353,6 +418,36 @@ impl TabBus {
         tabs.reverse();
 
         tabs
+    }
+
+    fn fuzzy_tabs(tabs: &Vec<(String, String)>) -> Option<String> {
+        debug!("fuzzy tabs: {:?}", tabs);
+
+        if tabs.len() == 0 {
+            println!("No active tabs.");
+            return None;
+        }
+
+        let options = SkimOptionsBuilder::default()
+            .height(Some("10%"))
+            .reverse(true)
+            .build()
+            .unwrap();
+        let item_reader = SkimItemReader::default();
+
+        let items_str = tabs
+            .iter()
+            .map(|(name, _doc)| name.clone())
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        let items = item_reader.of_bufread(Cursor::new(items_str));
+
+        let selected_items = Skim::run_with(&options, Some(items))
+            .map(|out| out.selected_items)
+            .unwrap_or_else(|| Vec::new());
+
+        selected_items.first().map(|i| i.output().into())
     }
 
     fn echo_tabs(tabs: &Vec<(String, String)>) {
